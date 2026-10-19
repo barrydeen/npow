@@ -4,16 +4,20 @@
 #include <cstdint>
 #include <vector>
 
-// The serialized event with a 12-digit zero-padded decimal nonce placeholder.
-// `tail` starts at the 64-byte boundary at or before the nonce and includes
-// SHA-256 padding. The kernel patches `nonce_off..nonce_off+12` in the tail.
+// The full serialized event, SHA-256 padded (length is a multiple of 64),
+// with a 12-digit decimal nonce placeholder at `digit_off`. The miner owns
+// the nonce space: digits 0-3 are set per launch (host), digits 4-11 vary on
+// the GPU. The 8 GPU-varying digits (digit_off+4 .. +11) must not straddle a
+// 64-byte block boundary.
 struct GpuJob {
-  uint32_t midstate[8];
-  std::vector<unsigned char> tail;
-  int nonce_off = 0;  // index of first nonce digit within `tail`
+  std::vector<unsigned char> msg;
+  int digit_off = 0;  // index of the first of the 12 nonce digits in `msg`
   int diff = 0;
   uint64_t epoch = 0;  // bumped on every job update
 };
+
+// Largest padded message the miner accepts.
+constexpr size_t kMaxMinerMsg = 64 * 1024;
 
 struct GpuFound {
   int gpu = -1;

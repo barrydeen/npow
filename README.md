@@ -1,8 +1,8 @@
 # npow
 
-Nostr [NIP-13](https://github.com/nostr-protocol/nips/blob/master/13.md) proof-of-work miner for notes and replies, written in CUDA. Benchmarked at **~3 GH/s per RTX 3090** (~6 GH/s on two).
+Nostr [NIP-13](https://github.com/nostr-protocol/nips/blob/master/13.md) proof-of-work miner for notes and replies, written in CUDA. Benchmarked on an RTX 3090 at **~7.8 GH/s** for short notes and ~1.8 GH/s for 280-character notes (per GPU; GPUs search disjoint nonce ranges, so rates add).
 
-Mines the event id with a midstate SHA-256 kernel (only blocks touching the nonce are recomputed), commits the target difficulty in the `nonce` tag per the NIP, and refreshes `created_at` while mining.
+Mines the event id with a midstate SHA-256 kernel (only blocks from the nonce onward are recomputed; the rounds before the varying digits and the message schedule of the trailing constant blocks are precomputed on the host), commits the target difficulty in the `nonce` tag per the NIP, and refreshes `created_at` while mining.
 
 **Architecture:** the backend only mines. Signing happens in the browser via a NIP-07 extension (`window.nostr.signEvent`), and publishing/fetching/relay-list lookup (NIP-65 outbox/inbox, NIP-10 reply tags, NIP-01 `q`-tag quotes) belong to the frontend with [nostr-tools](https://github.com/nbd-wtf/nostr-tools) — the event id does not commit to the signature, so signing *after* mining is valid.
 
@@ -47,7 +47,8 @@ Parent events come from a JSON file (or `-` for stdin) — fetch them with your 
 
 ## Notes
 
-- Nonce is a 12-digit zero-padded decimal counter rendered into the last `nonce` tag; each GPU strides its own portion of the nonce space per batch.
+- The `nonce` tag value is a run of constant `0`s followed by a 12-digit decimal counter. The leading-zero count is chosen per event so the GPU-varying digits land in the fewest possible SHA-256 blocks, as late in their block as possible (short notes hash a single block per attempt). The tag value can therefore be up to ~75 characters long; NIP-13 only requires it to be a string.
+- Digits 0–3 of the counter are a per-launch index (GPU *i* of *n* takes indices *i*, *i+n*, …), digits 4–9 are the CUDA thread, digits 10–11 an in-thread loop.
 - Difficulty > 45 is rejected by `serve` (CLI allows up to 80).
 
 ## License

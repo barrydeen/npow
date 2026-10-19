@@ -199,36 +199,73 @@ static std::string tags_with_nonce(const std::string& inner,
   return t;
 }
 
+// Nonce tag value = `pad` constant '0's followed by the 12 mined digits.
+static std::string nonce_value(int pad, const std::string& nonce12) {
+  return std::string((size_t)pad, '0') + nonce12;
+}
+
 static Serialized build_mining_ser(const std::string& pk_hex, uint64_t ts,
                                    int kind, const std::string& inner_tags,
                                    const std::string& esc_content,
-                                   const std::string& nonce, int diff) {
+                                   const std::string& nonce12, int diff,
+                                   int pad) {
   std::string A = "[0,\"" + pk_hex + "\"," + std::to_string(ts) + "," +
                   std::to_string(kind) + ",[";
   std::string B = inner_tags.empty() ? "" : inner_tags + ",";
-  std::string C = "[\"nonce\",\"";
+  std::string C = "[\"nonce\",\"" + std::string((size_t)pad, '0');
   Serialized s;
-  s.ser = A + B + C + nonce + "\",\"" + std::to_string(diff) + "\"]]," +
+  s.ser = A + B + C + nonce12 + "\",\"" + std::to_string(diff) + "\"]]," +
           esc_content + "]";
   s.nonce_off = A.size() + B.size() + C.size();
   return s;
+}
+
+// Only the SHA-256 blocks from the one holding the GPU-varying nonce digits
+// (digits 4..11) onward are hashed per attempt. Leading '0's in the nonce
+// value shift those digits; pick the pad that minimises hashed blocks, then
+// maximises how many rounds of that block can be precomputed (digits late in
+// the block), then prefers the shortest pad. The 8 varying digits must not
+// straddle a block boundary.
+static int choose_nonce_pad(size_t prefix_len, size_t suffix_len) {
+  int best = 0;
+  size_t best_blocks = SIZE_MAX, best_word = 0;
+  for (int pad = 0; pad < 64; pad++) {
+    size_t q = prefix_len + (size_t)pad;  // first digit
+    size_t lo = q + 4;                    // first GPU-varying digit
+    if (lo / 64 != (lo + 7) / 64) continue;
+    size_t len = q + 12 + suffix_len;
+    size_t blocks = (len + 9 + 63) / 64 - lo / 64;
+    size_t word = (lo % 64) / 4;
+    if (blocks < best_blocks || (blocks == best_blocks && word > best_word)) {
+      best = pad;
+      best_blocks = blocks;
+      best_word = word;
+    }
+  }
+  return best;
+}
+
+static int nonce_pad_for(const std::string& pk_hex, uint64_t ts, int kind,
+                         const std::string& inner_tags,
+                         const std::string& esc_content, int diff) {
+  auto s = build_mining_ser(pk_hex, ts, kind, inner_tags, esc_content,
+                            "000000000000", diff, 0);
+  return choose_nonce_pad(s.nonce_off, s.ser.size() - s.nonce_off - 12);
 }
 
 static GpuJob make_job(const Serialized& s, int diff, uint64_t epoch) {
   GpuJob job;
   job.epoch = epoch;
   job.diff = diff;
-  size_t k = s.nonce_off & ~(size_t)63;
-  sha256_midstate((const unsigned char*)s.ser.data(), k / 64, job.midstate);
   size_t len = s.ser.size();
   size_t padded = ((len + 9 + 63) / 64) * 64;
-  job.tail.assign(padded - k, 0);
-  memcpy(job.tail.data(), s.ser.data() + k, len - k);
-  job.tail[len - k] = 0x80;
+  job.msg.assign(padded, 0);
+  memcpy(job.msg.data(), s.ser.data(), len);
+  job.msg[len] = 0x80;
   uint64_t bits = (uint64_t)len * 8;
   for (int i = 0; i < 8; i++)
-    job.tail[job.tail.size() - 1 - i] = (unsigned char)(bits >> (8 * i));
-  job.nonce_off = (int)(s.nonce_off - k);
+    job.msg[padded - 1 - i] = (unsigned char)(bits >> (8 * i));
+  job.digit_off = (int)s.nonce_off;
   return job;
 }
 
@@ -348,6 +385,7 @@ struct MineOutcome {
   bool ok = false;
   bool cancelled = false;
   std::string id_hex, error;
+  std::string nonce_str;  // full nonce tag value (pad + 12 digits)
   uint64_t nonce = 0, ts = 0;
   double secs = 0;
 };
@@ -363,10 +401,12 @@ static MineOutcome mine_with(Miner& miner, const std::string& pk_hex,
   auto t0 = std::chrono::steady_clock::now();
   auto last_stats = t0;
   while (!g_stop.load() && !g_cancel.load()) {
+    const int pad =
+        nonce_pad_for(pk_hex, ts, kind, inner_tags, esc_content, diff);
     auto ser = build_mining_ser(pk_hex, ts, kind, inner_tags, esc_content,
-                                "000000000000", diff);
+                                "000000000000", diff, pad);
     GpuJob job = make_job(ser, diff, 0);
-    if (job.tail.size() > 48 * 1024) {
+    if (job.msg.size() > kMaxMinerMsg) {
       out.error = "event too large for the miner";
       return out;
     }
@@ -378,7 +418,7 @@ static MineOutcome mine_with(Miner& miner, const std::string& pk_hex,
         miner.pause();
         std::string nonce12 = pad12(f.nonce);
         auto fin = build_mining_ser(pk_hex, ts, kind, inner_tags, esc_content,
-                                    nonce12, diff);
+                                    nonce12, diff, pad);
         unsigned char id[32];
         sha256_host((const unsigned char*)fin.ser.data(), fin.ser.size(), id);
         if (count_lz_bits(id) < diff) {
@@ -388,6 +428,7 @@ static MineOutcome mine_with(Miner& miner, const std::string& pk_hex,
         out.ok = true;
         out.id_hex = to_hex(id, 32);
         out.nonce = f.nonce;
+        out.nonce_str = nonce_value(pad, nonce12);
         out.ts = ts;
         out.secs = std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0)
@@ -576,7 +617,7 @@ static int cmd_client(int argc, char** argv, Mode mode) {
     fprintf(stderr, "%s\n", m.error.empty() ? "interrupted" : m.error.c_str());
     return m.error.empty() ? 130 : 1;
   }
-  uint64_t nonce = m.nonce, found_ts = m.ts;
+  uint64_t found_ts = m.ts;
   double secs = m.secs;
   unsigned char id[32];
   {
@@ -598,7 +639,7 @@ static int cmd_client(int argc, char** argv, Mode mode) {
   std::string out = "{\"id\":\"" + id_hex + "\",\"pubkey\":\"" + pk_hex +
                     "\",\"created_at\":" + std::to_string(found_ts) +
                     ",\"kind\":" + std::to_string(o.kind) + ",\"tags\":" +
-                    tags_with_nonce(inner, pad12(nonce), o.diff) +
+                    tags_with_nonce(inner, m.nonce_str, o.diff) +
                     ",\"content\":" + esc_content;
   if (!sig_hex.empty()) out += ",\"sig\":\"" + sig_hex + "\"";
   out += "}";
@@ -1048,10 +1089,10 @@ static int cmd_serve(int argc, char** argv) {
                 "{\"error\":\"" + m.error + "\"}"};
       }
       std::string ev = event_object_json(m.id_hex, pk_hex, m.ts, kind, inner,
-                                         pad12(m.nonce), diff,
+                                         m.nonce_str, diff,
                                          jescape(content->s));
       std::string resp = "{\"id\":\"" + m.id_hex + "\",\"nonce\":\"" +
-                         pad12(m.nonce) + "\",\"difficulty\":" +
+                         m.nonce_str + "\",\"difficulty\":" +
                          std::to_string(diff) + ",\"created_at\":" +
                          std::to_string(m.ts) + ",\"event\":" + ev + "}";
       return {200, "application/json", resp};
@@ -1157,7 +1198,7 @@ static int cmd_selftest() {
     uint64_t ts = (uint64_t)time(nullptr);
     Miner miner(gpus);
     MineOutcome m = mine_with(miner, pk_hex, ts, 1, "", esc, 20, 60);
-    uint64_t nonce = m.nonce, ts_out = m.ts;
+    uint64_t ts_out = m.ts;
     unsigned char id[32];
     {
       std::vector<unsigned char> idv;
@@ -1170,7 +1211,7 @@ static int cmd_selftest() {
     if (ok) {
       std::string ser2 =
           raw_serialization(pk_hex, ts_out, 1,
-                            tags_with_nonce("", pad12(nonce), 20), esc);
+                            tags_with_nonce("", m.nonce_str, 20), esc);
       unsigned char id2[32];
       sha256_host((const unsigned char*)ser2.data(), ser2.size(), id2);
       ok = memcmp(id2, id, 32) == 0;
