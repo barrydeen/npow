@@ -636,17 +636,17 @@ const status = t => $('status').textContent = t;
   }
 })();
 async function publish(signed) {
-  const urls = $('relays').value.split(/[\\s,]+/).filter(Boolean);
+  const urls = $('relays').value.split(/[\s,]+/).filter(Boolean);
   const { Relay } = await import('https://esm.sh/nostr-tools@2');
-  let log = '\\npublish:\\n';
+  let log = '\npublish:\n';
   for (const u of urls) {
     try {
       const r = await Relay.connect(u);
       await r.publish(signed);
       r.close();
-      log += '  ✓ ' + u + '\\n';
+      log += '  ✓ ' + u + '\n';
     } catch (e) {
-      log += '  ✗ ' + u + ' — ' + (e.reason || e.message || e) + '\\n';
+      log += '  ✗ ' + u + ' — ' + (e.reason || e.message || e) + '\n';
     }
   }
   return log;
@@ -660,17 +660,17 @@ async function go(dry) {
   const r = await fetch('/api/mine', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
   const data = await r.json();
   if (!r.ok) { out.textContent = 'error ' + r.status + ': ' + (data.error || '?'); return; }
-  if (dry) { out.textContent = 'mined id ' + data.id + '\\n\\n' + JSON.stringify(data.event, null, 2); return; }
-  out.textContent = 'mined id ' + data.id + '\\nasking extension to sign…';
+  if (dry) { out.textContent = 'mined id ' + data.id + '\n\n' + JSON.stringify(data.event, null, 2); return; }
+  out.textContent = 'mined id ' + data.id + '\nasking extension to sign…';
   try {
     const signed = await window.nostr.signEvent(data.event);
     const vr = await fetch('/api/verify', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(signed)});
     const v = await vr.json();
     let text = 'id:        ' + signed.id +
-      '\\ndifficulty: ' + v.difficulty + ' bits (committed ' + v.committed + ')' +
-      '\\nsignature:  ' + (v.sig_valid ? 'valid' : 'INVALID') +
-      '\\n\\n' + JSON.stringify(signed, null, 2);
-    out.textContent = text + '\\npublishing via nostr-tools…';
+      '\ndifficulty: ' + v.difficulty + ' bits (committed ' + v.committed + ')' +
+      '\nsignature:  ' + (v.sig_valid ? 'valid' : 'INVALID') +
+      '\n\n' + JSON.stringify(signed, null, 2);
+    out.textContent = text + '\npublishing via nostr-tools…';
     out.textContent = text + await publish(signed);
   } catch (e) { out.textContent = 'mined ' + data.id + ' but signing failed: ' + e; }
 }
