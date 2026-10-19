@@ -29,6 +29,15 @@
 static std::atomic<bool> g_stop{false};
 static void on_signal(int) { g_stop.store(true); }
 
+static int64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+static std::atomic<int64_t> g_mine_start_ns{0};
+static std::atomic<bool> g_cancel{false};
+
+
 static secp256k1_context* g_ctx = nullptr;
 
 static void die(const std::string& msg) {
@@ -337,6 +346,7 @@ static bool verbose_stats = false;
 
 struct MineOutcome {
   bool ok = false;
+  bool cancelled = false;
   std::string id_hex, error;
   uint64_t nonce = 0, ts = 0;
   double secs = 0;
@@ -352,7 +362,7 @@ static MineOutcome mine_with(Miner& miner, const std::string& pk_hex,
   GpuFound f;
   auto t0 = std::chrono::steady_clock::now();
   auto last_stats = t0;
-  while (!g_stop.load()) {
+  while (!g_stop.load() && !g_cancel.load()) {
     auto ser = build_mining_ser(pk_hex, ts, kind, inner_tags, esc_content,
                                 "000000000000", diff);
     GpuJob job = make_job(ser, diff, 0);
@@ -385,6 +395,11 @@ static MineOutcome mine_with(Miner& miner, const std::string& pk_hex,
         return out;
       }
       if (g_stop.load()) break;
+      if (g_cancel.load()) {
+        miner.pause();
+        out.cancelled = true;
+        return out;
+      }
       auto nowc = std::chrono::steady_clock::now();
       double elapsed = std::chrono::duration<double>(nowc - t0).count();
       if (max_seconds > 0 && elapsed > max_seconds) {
@@ -457,7 +472,7 @@ static int cmd_client(int argc, char** argv, Mode mode) {
       default: return 2;
     }
   }
-  if (o.diff < 1 || o.diff > 80) die("--difficulty must be 1..80");
+  if (o.diff < 1 || o.diff > 99) die("--difficulty must be 1..99");
 
   // Resolve the parent event for reply/quote: --id (fetched from the big
   // public relays) or --to (local JSON file / stdin).
@@ -605,39 +620,149 @@ static const char* kIndexHtml = R"HTML(<!doctype html>
  body{background:#111;color:#ddd;font-family:ui-monospace,monospace;max-width:720px;margin:2rem auto;padding:0 1rem}
  h1{color:#7f5af0;font-size:1.4rem} h1 span{color:#666;font-weight:400;font-size:.8rem}
  label{display:block;margin:1rem 0 .3rem;color:#999;font-size:.8rem}
- input,textarea{width:100%;box-sizing:border-box;background:#1b1b23;color:#eee;border:1px solid #333;border-radius:6px;padding:.5rem;font-family:inherit}
- textarea{min-height:6rem} input[type=number]{width:8rem}
- button{background:#7f5af0;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;margin-top:1rem;cursor:pointer;font-family:inherit;font-size:.9rem}
- button:hover{filter:brightness(1.15)}
- #out{background:#0c0c11;border:1px solid #333;border-radius:6px;padding:1rem;margin-top:1rem;white-space:pre-wrap;word-break:break-all;font-size:.75rem;min-height:2rem}
- #status{color:#999;font-size:.75rem}
- .row{display:flex;gap:1rem} .row>div{flex:1}
-</style></head><body>
+  input,textarea,select{width:100%;box-sizing:border-box;background:#1b1b23;color:#eee;border:1px solid #333;border-radius:6px;padding:.5rem;font-family:inherit}
+  textarea{min-height:6rem} input[type=number]{width:8rem}
+  button{background:#7f5af0;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;margin-top:1rem;cursor:pointer;font-family:inherit;font-size:.9rem}
+  button:hover{filter:brightness(1.15)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  #noteinfo{color:#999;font-size:.75rem;margin-top:.4rem;white-space:pre-wrap;word-break:break-word}
+  #hashrate{color:#7f5af0;font-size:.8rem;margin-top:.6rem;min-height:1.1rem;font-variant-numeric:tabular-nums}
+  #out{background:#0c0c11;border:1px solid #333;border-radius:6px;padding:1rem;margin-top:1rem;white-space:pre-wrap;word-break:break-all;font-size:.75rem;min-height:2rem}
+  #status{color:#999;font-size:.75rem}
+  .row{display:flex;gap:1rem} .row>div{flex:1}
+ </style></head><body>
 <h1>npow <span>NIP-13 proof of work · 2× RTX 3090</span></h1>
 <div id="status">checking for nostr extension…</div>
 <label>pubkey (from extension)</label><input id="pk" placeholder="npub1… or hex">
 <label>content</label><textarea id="content" placeholder="hello world"></textarea>
-<div class="row"><div><label>difficulty (leading zero bits)</label><input id="diff" type="number" value="24" min="1" max="45"></div>
-<div><label>extra tags (JSON array)</label><input id="tags" value="[]"></div></div>
+<div class="row"><div><label>difficulty (leading zero bits)</label><input id="diff" type="number" value="24" min="1" max="99"></div>
+<div><label>extra tags (JSON array)</label><input id="tags" value='[["client","npow"]]'></div></div>
+<div class="row"><div><label>reply / quote note (note1, nevent1 or hex)</label><input id="note" placeholder="note1… / nevent1… / 64-char hex"></div>
+<div style="flex:0 0 8rem"><label>mode</label><select id="note_mode"><option value="none">none</option><option value="reply">reply</option><option value="quote">quote</option></select></div></div>
+<div id="noteinfo"></div>
 <label>relays to publish to (comma separated)</label>
 <input id="relays" value="wss://nos.lol, wss://relay.damus.io, wss://relay.primal.net">
-<button onclick="go(false)">mine + sign + publish</button>
-<button onclick="go(true)" style="background:#333">mine only (no signature)</button>
+<button id="mine1" onclick="go(false)">mine + sign + publish</button>
+<button id="mine2" onclick="go(true)" style="background:#333">mine only (no signature)</button>
+<button id="cancelbtn" onclick="cancelJob()" style="background:#333;display:none">cancel</button>
+<div id="hashrate"></div>
 <pre id="out"></pre>
 <script>
 const $ = id => document.getElementById(id);
 const status = t => $('status').textContent = t;
+let toolsP;
+const tools = () => toolsP || (toolsP = import('https://esm.sh/nostr-tools@2'));
+let _pool;
+const getPool = async () => _pool || (_pool = new (await tools()).SimplePool());
+const parseRelays = () => $('relays').value.split(/[\s,]+/).filter(Boolean);
+const setRelays = urls => $('relays').value = [...new Set(urls)].join(', ');
+const fmtRate = r => r >= 1e9 ? (r/1e9).toFixed(2)+' GH/s' : r >= 1e6 ? (r/1e6).toFixed(1)+' MH/s' : (r/1e3).toFixed(0)+' kH/s';
+let noteState = null;
 (async () => {
   if (window.nostr && window.nostr.signEvent) {
     status('nostr extension detected (NIP-07)');
-    try { $('pk').value = await window.nostr.getPublicKey(); } catch (e) {}
+    try { $('pk').value = await window.nostr.getPublicKey(); loadOutbox(); } catch (e) {}
   } else {
     status('no NIP-07 extension detected — “mine only” still works, or paste a pubkey');
   }
 })();
+$('pk').addEventListener('change', () => { if ($('pk').value.trim()) loadOutbox(); });
+$('note').addEventListener('change', loadNote);
+$('note_mode').addEventListener('change', loadNote);
+async function hexPk(v) {
+  v = (v || '').trim();
+  if (/^[0-9a-f]{64}$/.test(v)) return v;
+  if (v.startsWith('npub1')) { const { nip19 } = await tools(); return nip19.decode(v).data; }
+  return null;
+}
+async function relayList(bootstrap, pk, marker) {
+  const p = await getPool();
+  const ev = await p.get(bootstrap, {kinds:[10002], authors:[pk], limit:1});
+  if (!ev) return [];
+  const out = new Set();
+  for (const t of ev.tags) if (t[0] === 'r' && t[1] && (!t[2] || t[2] === marker)) out.add(t[1]);
+  return [...out];
+}
+async function loadOutbox() {
+  const pk = await hexPk($('pk').value);
+  if (!pk) return;
+  try {
+    const outbox = await relayList(parseRelays(), pk, 'write');
+    if (outbox.length) { setRelays(outbox); status('outbox relays loaded from your NIP-65 list'); }
+    else status('no NIP-65 relay list found — keeping default relays');
+  } catch (e) { status('could not load relay list: ' + (e.message || e)); }
+}
+async function loadNote() {
+  const raw = $('note').value.trim();
+  const mode = $('note_mode').value;
+  const info = $('noteinfo');
+  const cleanup = () => {
+    if (!noteState) return;
+    const oldKeys = new Set(noteState.derived.map(t => JSON.stringify(t)));
+    try { $('tags').value = JSON.stringify(JSON.parse($('tags').value || '[]').filter(t => !oldKeys.has(JSON.stringify(t)))); } catch {}
+    setRelays(parseRelays().filter(u => !noteState.inbox.includes(u)));
+    noteState = null;
+  };
+  if (!raw || mode === 'none') { cleanup(); info.textContent = ''; return; }
+  const { nip19 } = await tools();
+  let id = raw.toLowerCase(), authorHint = null, hintRelays = [];
+  if (raw.startsWith('note1') || raw.startsWith('nevent1')) {
+    let d;
+    try { d = nip19.decode(raw); } catch (e) { info.textContent = 'invalid bech32 entity'; return; }
+    if (d.type === 'note') id = d.data;
+    else if (d.type === 'nevent') { id = d.data.id; authorHint = d.data.author || null; hintRelays = d.data.relays || []; }
+    else { info.textContent = 'unsupported entity (want note1 or nevent1)'; return; }
+  }
+  if (!/^[0-9a-f]{64}$/.test(id)) { info.textContent = 'not a valid note id'; return; }
+  info.textContent = 'fetching note…';
+  const bootstrap = parseRelays();
+  let ev = null;
+  try { ev = await (await getPool()).get([...new Set([...bootstrap, ...hintRelays])], {ids:[id], limit:1}, {maxWait: 8000}); } catch {}
+  if (!ev && !authorHint) { info.textContent = 'could not find that note on any relay'; return; }
+  const author = ev ? ev.pubkey : authorHint;
+  const me = await hexPk($('pk').value);
+  const derived = [];
+  if (mode === 'quote') {
+    derived.push(['q', id, hintRelays[0] || '']);
+  } else {
+    let root = null;
+    if (ev) {
+      const etags = ev.tags.filter(t => t[0] === 'e' && t[1]);
+      root = etags.find(t => t[3] === 'root') || etags[0] || null;
+    }
+    if (root) derived.push(['e', root[1], root[2] || '', 'root']);
+    derived.push(['e', id, hintRelays[0] || '', 'reply']);
+  }
+  const pts = new Set([author]);
+  if (mode === 'reply' && ev) for (const t of ev.tags) if (t[0] === 'p' && t[1]) pts.add(t[1]);
+  pts.delete(me);
+  for (const pk2 of pts) derived.push(['p', pk2]);
+  let cur;
+  try { cur = JSON.parse($('tags').value || '[]'); } catch { info.textContent = 'extra tags is not valid JSON — fix it and retry'; return; }
+  if (noteState) {
+    const oldKeys = new Set(noteState.derived.map(t => JSON.stringify(t)));
+    cur = cur.filter(t => !oldKeys.has(JSON.stringify(t)));
+  }
+  const merged = [...cur];
+  for (const t of derived) if (!merged.some(x => JSON.stringify(x) === JSON.stringify(t))) merged.push(t);
+  $('tags').value = JSON.stringify(merged);
+  if (noteState) setRelays(parseRelays().filter(u => !noteState.inbox.includes(u)));
+  let inbox = [];
+  try { inbox = await relayList(bootstrap, author, 'read'); } catch {}
+  if (inbox.length) setRelays([...parseRelays(), ...inbox]);
+  noteState = {id, derived, inbox};
+  if (mode === 'quote') {
+    const ref = 'nostr:' + nip19.neventEncode({id, relays: hintRelays.length ? hintRelays : undefined, author: author || undefined, kind: ev ? ev.kind : 1});
+    if (!$('content').value.includes(ref)) $('content').value = ref + '\n\n' + $('content').value;
+  }
+  const short = author ? nip19.npubEncode(author).slice(0, 16) + '…' : '?';
+  info.textContent = (mode === 'reply' ? 'replying to ' : 'quoting ') + short +
+    (ev ? ' — “' + ev.content.slice(0, 100) + (ev.content.length > 100 ? '…' : '') + '”' : ' (note not on relays — using embedded metadata)') +
+    (inbox.length ? '\n+ ' + inbox.length + ' inbox relay(s) of the author' : '');
+}
 async function publish(signed) {
-  const urls = $('relays').value.split(/[\s,]+/).filter(Boolean);
-  const { Relay } = await import('https://esm.sh/nostr-tools@2');
+  const urls = parseRelays();
+  const { Relay } = await tools();
   let log = '\npublish:\n';
   for (const u of urls) {
     try {
@@ -651,14 +776,42 @@ async function publish(signed) {
   }
   return log;
 }
+function setBusy(v) {
+  $('mine1').disabled = v;
+  $('mine2').disabled = v;
+  $('cancelbtn').style.display = v ? '' : 'none';
+}
+async function cancelJob() { try { await fetch('/api/cancel', {method:'POST'}); } catch {} }
 async function go(dry) {
   const out = $('out');
   out.textContent = 'mining…';
+  $('hashrate').textContent = '';
   if (!$('pk').value) { out.textContent = 'need a pubkey (connect a NIP-07 extension or paste one)'; return; }
   let body = {content: $('content').value, difficulty: +$('diff').value, pubkey: $('pk').value.trim()};
   try { body.tags = JSON.parse($('tags').value || '[]'); } catch (e) { out.textContent = 'bad tags JSON: ' + e; return; }
-  const r = await fetch('/api/mine', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+  setBusy(true);
+  let polling = true;
+  (async () => {
+    while (polling) {
+      try {
+        const s = await (await fetch('/api/stats')).json();
+        if (s.active) $('hashrate').textContent = '⚡ ' + fmtRate(s.total) + '  (' + s.gpus.map(fmtRate).join(' + ') + ')  ·  ' + Math.floor(s.elapsed) + 's';
+      } catch {}
+      await new Promise(r => setTimeout(r, 500));
+    }
+  })();
+  let r;
+  try {
+    r = await fetch('/api/mine', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+  } catch (e) {
+    polling = false; setBusy(false);
+    out.textContent = 'mining failed: ' + e;
+    return;
+  }
+  polling = false;
+  setBusy(false);
   const data = await r.json();
+  if (data.cancelled) { $('hashrate').textContent = ''; out.textContent = 'cancelled — lower the difficulty and try again'; return; }
   if (!r.ok) { out.textContent = 'error ' + r.status + ': ' + (data.error || '?'); return; }
   if (dry) { out.textContent = 'mined id ' + data.id + '\n\n' + JSON.stringify(data.event, null, 2); return; }
   out.textContent = 'mined id ' + data.id + '\nasking extension to sign…';
@@ -774,7 +927,7 @@ static int cmd_serve(int argc, char** argv) {
       default: return 2;
     }
   }
-  if (def_diff < 1 || def_diff > 45) die("--difficulty must be 1..45");
+  if (def_diff < 1 || def_diff > 99) die("--difficulty must be 1..99");
   if (!gpus_set) gpus = default_gpus();
 
   static Miner miner(gpus);
@@ -790,6 +943,46 @@ static int cmd_serve(int argc, char** argv) {
               "{\"ok\":true,\"gpus\":" + std::to_string((int)gpus.size()) +
                   ",\"default_difficulty\":" + std::to_string(def_diff) +
                   ",\"version\":\"0.1.0\"}"};
+    if (req.method == "GET" && req.path == "/api/stats") {
+      int64_t start = g_mine_start_ns.load(std::memory_order_acquire);
+      if (start == 0)
+        return {200, "application/json", "{\"active\":false}"};
+      static std::mutex stats_mtx;
+      static std::vector<uint64_t> last_per_gpu;
+      static int64_t last_t = 0;
+      double total = 0;
+      std::string arr = "[";
+      {
+        std::lock_guard<std::mutex> lk(stats_mtx);
+        int64_t now = now_ns();
+        if (last_t == 0) {
+          last_t = start;
+          last_per_gpu.assign(miner.gpuCount(), 0);
+        }
+        double dt = (now - std::max(last_t, start)) / 1e9;
+        if (dt < 0.1) dt = 0.1;
+        for (int i = 0; i < miner.gpuCount(); i++) {
+          uint64_t cur = miner.rawCount(i);
+          uint64_t prev = i < (int)last_per_gpu.size() ? last_per_gpu[i] : 0;
+          double r = cur >= prev ? (double)(cur - prev) / dt : 0.0;
+          if (i) arr += ",";
+          arr += std::to_string((uint64_t)r);
+          total += r;
+          last_per_gpu[i] = cur;
+        }
+        last_t = now;
+      }
+      arr += "]";
+      return {200, "application/json",
+              "{\"active\":true,\"elapsed\":" +
+                  std::to_string((now_ns() - start) / 1e9) +
+                  ",\"total\":" + std::to_string((uint64_t)total) +
+                  ",\"gpus\":" + arr + "}"};
+    }
+    if (req.method == "POST" && req.path == "/api/cancel") {
+      g_cancel.store(true);
+      return {200, "application/json", "{\"ok\":true}"};
+    }
     if (req.method == "POST" && req.path == "/api/mine") {
       JVal body;
       try {
@@ -819,9 +1012,9 @@ static int cmd_serve(int argc, char** argv) {
       int diff = def_diff;
       if (body.find("difficulty") && body.find("difficulty")->t == JVal::Int) {
         diff = (int)body.find("difficulty")->i;
-        if (diff < 1 || diff > 45)
+        if (diff < 1 || diff > 99)
           return {400, "application/json",
-                  "{\"error\":\"difficulty must be 1..45\"}"};
+                  "{\"error\":\"difficulty must be 1..99\"}"};
       }
       std::string inner;
       if (body.find("tags") && body.find("tags")->t == JVal::Arr) {
@@ -841,13 +1034,19 @@ static int cmd_serve(int argc, char** argv) {
 
       if (!mine_mtx.try_lock())
         return {409, "application/json", "{\"error\":\"miner busy\"}"};
+      g_cancel.store(false);
+      g_mine_start_ns.store(now_ns(), std::memory_order_release);
       MineOutcome m =
           mine_with(miner, pk_hex, ts, kind, inner, jescape(content->s), diff,
                     1800);
+      g_mine_start_ns.store(0, std::memory_order_release);
       mine_mtx.unlock();
-      if (!m.ok)
+      if (!m.ok) {
+        if (m.cancelled)
+          return {200, "application/json", "{\"cancelled\":true}"};
         return {500, "application/json",
                 "{\"error\":\"" + m.error + "\"}"};
+      }
       std::string ev = event_object_json(m.id_hex, pk_hex, m.ts, kind, inner,
                                          pad12(m.nonce), diff,
                                          jescape(content->s));

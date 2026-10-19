@@ -44,6 +44,10 @@ class Miner {
 
   // Aggregate hashes/sec over the last `window_ms`; resets counters.
   double ratePerGpu(int gpu, double window_s) const;
+
+  // Non-destructive read of the per-GPU hash counter (for live stats polling).
+  uint64_t rawCount(int gpu) const;
+
   int gpuCount() const;
 
  private:

@@ -185,6 +185,10 @@ double Miner::ratePerGpu(int gpu, double window_s) const {
   return (double)h / window_s;
 }
 
+uint64_t Miner::rawCount(int gpu) const {
+  return impl_->counters[gpu].load(std::memory_order_relaxed);
+}
+
 int Miner::gpuCount() const { return (int)impl_->devices.size(); }
 
 void Miner::worker(size_t idx) {
