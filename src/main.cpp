@@ -420,12 +420,13 @@ static std::string event_object_json(const std::string& id_hex,
   return "{\"id\":\"" + id_hex + "\",\"pubkey\":\"" + pk_hex +
          "\",\"created_at\":" + std::to_string(ts) + ",\"kind\":" +
          std::to_string(kind) + ",\"tags\":" +
-         tags_with_nonce(inner, nonce12, diff) + ",\"content\":" +
-         esc_content + "}";
+          tags_with_nonce(inner, nonce12, diff) + ",\"content\":" +
+          esc_content + "}";
 }
 
-static int cmd_note_reply(int argc, char** argv, bool reply) {
+enum class Mode { Note, Reply, Quote };
 
+static int cmd_client(int argc, char** argv, Mode mode) {
   Options o;
   o.gpus = default_gpus();
   static struct option long_opts[] = {
@@ -457,7 +458,18 @@ static int cmd_note_reply(int argc, char** argv, bool reply) {
     }
   }
   if (o.diff < 1 || o.diff > 80) die("--difficulty must be 1..80");
-  if (reply && o.to.empty()) die("reply requires --to <parent-event.json|->");
+
+  // Resolve the parent event for reply/quote: --id (fetched from the big
+  // public relays) or --to (local JSON file / stdin).
+  JVal parent;
+  std::string parent_relay_hint;
+  if (mode != Mode::Note) {
+    if (o.to.empty())
+      die(mode == Mode::Reply ? "reply needs --to <parent-event.json|-> (fetch the parent with your nostr library or npow's web page)"
+                              : "quote needs --to <parent-event.json|-> (fetch the parent with your nostr library or npow's web page)");
+    std::string pjson = o.to == "-" ? read_all(std::cin) : read_file(o.to);
+    jparse(pjson, parent);
+  }
 
   unsigned char sec[32], pk32[32];
   bool have_sec = false;
@@ -486,28 +498,59 @@ static int cmd_note_reply(int argc, char** argv, bool reply) {
   if (content == "-") content = read_all(std::cin);
   if (content.size() > 60000) die("content too long");
 
-  std::string inner;
-  if (reply) {
-    std::string pjson = o.to == "-" ? read_all(std::cin) : read_file(o.to);
-    JVal parent;
-    jparse(pjson, parent);
-    std::string full = make_reply_tags(parent, o.relay);
-    inner = full.substr(1, full.size() - 2);
-  } else if (!o.tags.empty()) {
+  // User-provided extra tags, minus any nonce tags.
+  JVal user_tags;
+  user_tags.t = JVal::Arr;
+  if (!o.tags.empty()) {
     JVal tv;
     jparse(o.tags, tv);
     if (tv.t != JVal::Arr) die("--tags must be a JSON array of arrays");
-    JVal filtered;
-    filtered.t = JVal::Arr;
     for (auto& t : tv.arr) {
       bool is_nonce = t.t == JVal::Arr && !t.arr.empty() &&
                       t.arr[0].t == JVal::Str && t.arr[0].s == "nonce";
-      if (!is_nonce) filtered.arr.push_back(t);
+      if (!is_nonce) user_tags.arr.push_back(t);
     }
-    std::string full = jdump(filtered);
+  }
+
+  std::string inner;
+  std::string esc_content = jescape(content);
+  if (mode == Mode::Reply) {
+    std::string eff_relay = o.relay.empty() ? parent_relay_hint : o.relay;
+    std::string full = make_reply_tags(parent, eff_relay);
+    inner = full.substr(1, full.size() - 2);
+  } else if (mode == Mode::Quote) {
+    const JVal* pid = parent.find("id");
+    const JVal* ppk = parent.find("pubkey");
+    const JVal* pkind = parent.find("kind");
+    if (!pid || pid->t != JVal::Str || !ppk || ppk->t != JVal::Str)
+      die("parent event missing id/pubkey");
+    std::string eff_relay = o.relay.empty() ? parent_relay_hint : o.relay;
+    std::vector<std::string> hint;
+    if (!eff_relay.empty()) hint.push_back(eff_relay);
+    std::string nevent = b32enc::nevent(
+        pid->s, ppk->s, hint,
+        pkind && pkind->t == JVal::Int ? (int)pkind->i : 1);
+    esc_content = jescape(content + "\nnostr:" + nevent);
+    JVal tags = user_tags;
+    auto str_arr = [](std::vector<std::string> parts) {
+      JVal a;
+      a.t = JVal::Arr;
+      for (auto& s : parts) {
+        JVal sv;
+        sv.t = JVal::Str;
+        sv.s = s;
+        a.arr.push_back(std::move(sv));
+      }
+      return a;
+    };
+    tags.arr.push_back(str_arr({"q", pid->s, eff_relay, ppk->s}));
+    tags.arr.push_back(str_arr({"p", ppk->s}));
+    std::string full = jdump(tags);
+    inner = full.substr(1, full.size() - 2);
+  } else {
+    std::string full = jdump(user_tags);
     inner = full.substr(1, full.size() - 2);
   }
-  std::string esc_content = jescape(content);
 
   uint64_t ts = o.ts ? (uint64_t)o.ts : (uint64_t)time(nullptr);
   verbose_stats = true;
@@ -549,6 +592,7 @@ static int cmd_note_reply(int argc, char** argv, bool reply) {
           "mined %s… diff %d in %.2fs (%s avg)\n",
           id_hex.substr(0, 16).c_str(), o.diff, secs,
           human_rate(pow(2.0, o.diff) / (secs > 0 ? secs : 1)).c_str());
+
   printf("%s\n", out.c_str());
   return 0;
 }
@@ -575,7 +619,9 @@ static const char* kIndexHtml = R"HTML(<!doctype html>
 <label>content</label><textarea id="content" placeholder="hello world"></textarea>
 <div class="row"><div><label>difficulty (leading zero bits)</label><input id="diff" type="number" value="24" min="1" max="45"></div>
 <div><label>extra tags (JSON array)</label><input id="tags" value="[]"></div></div>
-<button onclick="go(false)">mine + sign</button>
+<label>relays to publish to (comma separated)</label>
+<input id="relays" value="wss://nos.lol, wss://relay.damus.io, wss://relay.primal.net">
+<button onclick="go(false)">mine + sign + publish</button>
 <button onclick="go(true)" style="background:#333">mine only (no signature)</button>
 <pre id="out"></pre>
 <script>
@@ -589,6 +635,22 @@ const status = t => $('status').textContent = t;
     status('no NIP-07 extension detected — “mine only” still works, or paste a pubkey');
   }
 })();
+async function publish(signed) {
+  const urls = $('relays').value.split(/[\\s,]+/).filter(Boolean);
+  const { Relay } = await import('https://esm.sh/nostr-tools@2');
+  let log = '\\npublish:\\n';
+  for (const u of urls) {
+    try {
+      const r = await Relay.connect(u);
+      await r.publish(signed);
+      r.close();
+      log += '  ✓ ' + u + '\\n';
+    } catch (e) {
+      log += '  ✗ ' + u + ' — ' + (e.reason || e.message || e) + '\\n';
+    }
+  }
+  return log;
+}
 async function go(dry) {
   const out = $('out');
   out.textContent = 'mining…';
@@ -598,16 +660,18 @@ async function go(dry) {
   const r = await fetch('/api/mine', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
   const data = await r.json();
   if (!r.ok) { out.textContent = 'error ' + r.status + ': ' + (data.error || '?'); return; }
-  if (dry) { out.textContent = 'mined id ' + data.id + '\n\n' + JSON.stringify(data.event, null, 2); return; }
-  out.textContent = 'mined id ' + data.id + '\nasking extension to sign…';
+  if (dry) { out.textContent = 'mined id ' + data.id + '\\n\\n' + JSON.stringify(data.event, null, 2); return; }
+  out.textContent = 'mined id ' + data.id + '\\nasking extension to sign…';
   try {
     const signed = await window.nostr.signEvent(data.event);
     const vr = await fetch('/api/verify', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(signed)});
     const v = await vr.json();
-    out.textContent = 'id:        ' + signed.id +
-      '\ndifficulty: ' + v.difficulty + ' bits (committed ' + v.committed + ')' +
-      '\nsignature:  ' + (v.sig_valid ? 'valid' : 'INVALID') +
-      '\n\n' + JSON.stringify(signed, null, 2);
+    let text = 'id:        ' + signed.id +
+      '\\ndifficulty: ' + v.difficulty + ' bits (committed ' + v.committed + ')' +
+      '\\nsignature:  ' + (v.sig_valid ? 'valid' : 'INVALID') +
+      '\\n\\n' + JSON.stringify(signed, null, 2);
+    out.textContent = text + '\\npublishing via nostr-tools…';
+    out.textContent = text + await publish(signed);
   } catch (e) { out.textContent = 'mined ' + data.id + ' but signing failed: ' + e; }
 }
 </script></body></html>)HTML";
@@ -940,9 +1004,12 @@ static void usage() {
           "npow — NIP-13 proof-of-work miner for Nostr notes and replies\n"
           "\n"
           "usage:\n"
-          "  npow note [opts] <content>          mine a kind-1 note\n"
+          "  npow note [opts] <content>          mine + publish a kind-1 note\n"
           "  npow reply [opts] --to <json> <content>\n"
-          "                                      mine a NIP-10 reply\n"
+          "                                      mine a NIP-10 reply (signing and\n"
+          "                                      publishing live in the frontend)\n"
+          "  npow quote [opts] --to <json> <content>\n"
+          "                                      mine a NIP-01 quote note\n"
           "  npow verify <event.json|->          recompute id/difficulty/sig\n"
           "  npow serve [opts]                   HTTP backend for a web frontend\n"
           "      --port <n>                      (default 8913, binds 127.0.0.1)\n"
@@ -958,8 +1025,8 @@ static void usage() {
           "  -t, --tags <json>      extra tags (JSON array; nonce tag added\n"
           "                         automatically, existing ones stripped)\n"
           "  -k, --kind <n>         event kind (default 1)\n"
-          "  -r, --relay <url>      relay hint used in reply e tags\n"
-          "      --to <file|->      parent event JSON for replies ('-' stdin)\n"
+          "  -r, --relay <url>      relay hint for e/q tags\n"
+          "      --to <file|->      parent event JSON from file/stdin instead\n"
           "  -g, --gpus <list>      CUDA device ordinals (default: all)\n"
           "      --ts <unix>        fixed created_at (default: now, refreshed)\n"
           "  -h, --help\n");
@@ -980,8 +1047,11 @@ int main(int argc, char** argv) {
     usage();
     return 0;
   }
-  if (cmd == "note" || cmd == "reply")
-    return cmd_note_reply(argc - 1, argv + 1, cmd == "reply");
+  if (cmd == "note" || cmd == "reply" || cmd == "quote") {
+    Mode mode = cmd == "note" ? Mode::Note
+                : cmd == "reply" ? Mode::Reply : Mode::Quote;
+    return cmd_client(argc - 1, argv + 1, mode);
+  }
   if (cmd == "verify") {
     if (argc != 3) {
       usage();
