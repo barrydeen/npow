@@ -654,9 +654,9 @@ async function publish(signed) {
 async function go(dry) {
   const out = $('out');
   out.textContent = 'mining…';
-  let body = {content: $('content').value, difficulty: +$('diff').value};
+  if (!$('pk').value) { out.textContent = 'need a pubkey (connect a NIP-07 extension or paste one)'; return; }
+  let body = {content: $('content').value, difficulty: +$('diff').value, pubkey: $('pk').value.trim()};
   try { body.tags = JSON.parse($('tags').value || '[]'); } catch (e) { out.textContent = 'bad tags JSON: ' + e; return; }
-  if (dry) { if (!$('pk').value) { out.textContent = 'dry run needs a pubkey'; return; } body.pubkey = $('pk').value; }
   const r = await fetch('/api/mine', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
   const data = await r.json();
   if (!r.ok) { out.textContent = 'error ' + r.status + ': ' + (data.error || '?'); return; }
@@ -799,10 +799,13 @@ static int cmd_serve(int argc, char** argv) {
       }
       std::vector<unsigned char> pkv;
       const JVal* pk = body.find("pubkey");
-      if (!pk || pk->t != JVal::Str || !parse_key(pk->s, pkv, false) ||
-          pkv.size() != 32)
+      if (!pk || pk->t != JVal::Str || pk->s.empty())
         return {400, "application/json",
-                "{\"error\":\"pubkey must be 64-char hex or npub1...\"}"};
+                "{\"error\":\"pubkey is required — call window.nostr.getPublicKey() "
+                "first (or paste a 64-char hex / npub1)\"}"};
+      if (!parse_key(pk->s, pkv, false) || pkv.size() != 32)
+        return {400, "application/json",
+                "{\"error\":\"pubkey must be 64-char hex or npub1…\"}"};
       std::string pk_hex = to_hex(pkv.data(), 32);
       const JVal* content = body.find("content");
       if (!content || content->t != JVal::Str)
@@ -880,7 +883,9 @@ static int cmd_serve(int argc, char** argv) {
   };
 
   int srv = http_listen(bind, port);
-  if (srv < 0) die("cannot bind " + bind + ":" + std::to_string(port));
+  if (srv < 0)
+    die("cannot bind " + bind + ":" + std::to_string(port) +
+        " — is another `npow serve` already running? (check: pgrep -ax npow)");
   fprintf(stderr, "npow serve: http://%s:%d (gpus:", bind.c_str(), port);
   for (int g : gpus) fprintf(stderr, " %d", g);
   fprintf(stderr, ", default difficulty %d)\n", def_diff);
